@@ -1,72 +1,158 @@
 package lru
 
-import "container/list"
+import (
+	"container/list"
+	"errors"
+)
+
+type EvictCallback func(key string, value Value)
+
+var _ LRUCache = (*Cache)(nil)
 
 // Cache is a LRU cache. It is not safe for concurrent access.
 type Cache struct {
-	// memory
+	cache    map[string]*list.Element
+	ll       *list.List
 	maxBytes int64
 	nbytes   int64
-	// lru impl
-	cache map[string]*list.Element
-	ll    *list.List
 	// optional and executed when an entry is purged.
-	OnEvicted func(key string, value Value)
+	OnEvicted EvictCallback
 }
 
-type entry struct {
-	k string
-	v Value
-}
-
-// Value use Len to count how many bytes it takes
-type Value interface {
-	Len() int
-}
-
-func New(maxBytes int64, onEvicted func(string, Value)) *Cache {
+func NewCache(maxBytes int64, onEvicted EvictCallback) (*Cache, error) {
+	if maxBytes <= 0 {
+		return nil, errors.New("must provide a postive maxBytes")
+	}
 	return &Cache{
-		maxBytes:  maxBytes,
 		ll:        list.New(),
 		cache:     make(map[string]*list.Element),
+		maxBytes:  maxBytes,
 		OnEvicted: onEvicted,
-	}
+	}, nil
 }
 
-// Get look ups a key's value
-func (c *Cache) Get(key string) (value Value, ok bool) {
+func (c *Cache) Add(key string, value Value) bool {
+	// Check for existing item
 	if e, ok := c.cache[key]; ok {
 		c.ll.MoveToFront(e)
-		d := e.Value.(*entry)
-		return d.v, true
+		e.Value.(*entry).v = value
+		return false
 	}
+
+	ent := &entry{
+		k: key,
+		v: value,
+	}
+	entry := c.ll.PushFront(ent)
+	c.cache[key] = entry
+	c.nbytes += int64(len(ent.k)) + int64(ent.v.Len())
+
+	evict := c.nbytes > c.maxBytes
+
+	if evict {
+		for c.nbytes != 0 && c.maxBytes < c.nbytes {
+			c.RemoveOldest()
+		}
+	}
+	return evict
+}
+
+func (c *Cache) Get(key string) (Value, bool) {
+	if e, ok := c.cache[key]; ok {
+		c.ll.MoveToFront(e)
+		return e.Value.(*entry).v, true
+	}
+	return nil, false
+}
+
+func (c *Cache) Contains(key string) (ok bool) {
+	_, ok = c.cache[key]
 	return
 }
 
-// removes the oldest item by LRU algorithm
-func (c *Cache) RemoveOldest() {
-	if e := c.ll.Back(); e != nil {
-		d := c.ll.Remove(e).(*entry)
-		delete(c.cache, d.k)
-		c.nbytes -= int64(len(d.k)) + int64(d.v.Len())
-		if c.OnEvicted != nil {
-			c.OnEvicted(d.k, d.v)
-		}
+func (c *Cache) Peek(key string) (value Value, ok bool) {
+	if v, ok := c.cache[key]; ok {
+		return v.Value.(*entry).v, true
+	}
+	return nil, false
+}
+
+func (c *Cache) Remove(key string) bool {
+	if v, ok := c.cache[key]; ok {
+		c.removeElement(v)
+		return true
+	}
+	return false
+}
+
+func (c *Cache) RemoveOldest() (string, Value, bool) {
+	e := c.ll.Back()
+	if e != nil {
+		c.removeElement(e)
+		ent := e.Value.(*entry)
+		return ent.k, ent.v, true
+	}
+	return "", nil, false
+}
+
+func (c *Cache) removeElement(e *list.Element) {
+	c.ll.Remove(e)
+	ent := e.Value.(*entry)
+	delete(c.cache, ent.k)
+	c.nbytes -= ent.v.Len() + int64(len(ent.k))
+	if c.OnEvicted != nil {
+		c.OnEvicted(ent.k, ent.v)
 	}
 }
 
-func (c *Cache) Add(key string, value Value) {
-	if e, ok := c.cache[key]; ok {
-		c.ll.MoveToFront(e)
-		d := e.Value.(*entry)
-		c.nbytes += int64(value.Len()) - int64(d.v.Len())
-		d.v = value
-	} else {
-		e := c.ll.PushFront(&entry{key, value})
-		c.cache[key] = e
-		c.nbytes += int64(len(key)) + int64(value.Len())
+func (c *Cache) GetOldest() (string, Value, bool) {
+	e := c.ll.Back()
+	if e != nil {
+		ent := e.Value.(*entry)
+		return ent.k, ent.v, true
 	}
-	for c.maxBytes != 0 && c.maxBytes < c.nbytes {
+	return "", nil, false
+}
+
+func (c *Cache) Keys() []string {
+	keys := make([]string, len(c.cache))
+	i := 0
+	for iter := c.ll.Back(); iter != nil; iter = iter.Prev() {
+		keys[i] = iter.Value.(*entry).k
+		i++
+	}
+	return keys
+}
+
+func (c *Cache) Len() int64 {
+	return int64(c.nbytes)
+}
+
+func (c *Cache) Purge() {
+	for k, v := range c.cache {
+		if c.OnEvicted != nil {
+			c.OnEvicted(k, v.Value.(*entry).v)
+		}
+		delete(c.cache, k)
+	}
+	c.ll.Init()
+	c.nbytes = 0
+}
+
+// RemaxBytes changes the cache maxBytes.
+func (c *Cache) RemaxBytes(maxBytes int64) (evicted int64, err error) {
+	if maxBytes <= 0 {
+		return 0, errors.New("must provide a postive maxBytes")
+	}
+
+	diff := int64(c.nbytes) - maxBytes
+	if diff < 0 {
+		diff = 0
+	}
+	var i int64 = 0
+	for ; c.nbytes > maxBytes; i++ {
 		c.RemoveOldest()
 	}
+	c.maxBytes = maxBytes
+	return i, nil
 }

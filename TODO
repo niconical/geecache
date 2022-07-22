@@ -1,1 +1,4 @@
 1. impl list
+2. go 1.18 generics feature
+3. use RPC to replace httpGetter interface
+4. impl expiretime
